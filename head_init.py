@@ -20,7 +20,7 @@ def init_last_layer(layer: nn.Linear) -> None:
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    samples_per_class = 40
+    samples_per_class = 80
     batch_size = 256
     seed = 42
 
