@@ -25,7 +25,7 @@ def init_last_layer(layer: nn.Linear) -> None:
     seed = 42
 
     lda_shrinkage = 0.3
-    logreg_C = 0.007
+    logreg_C = 0.020
     alpha_lda = 0.10
     alpha_logreg = 1.0 - alpha_lda
 
