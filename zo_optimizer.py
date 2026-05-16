@@ -1,262 +1,326 @@
-"""
-zo_optimizer.py — Zero-order optimizer skeleton (student-implemented).
-
-Students: Implement your gradient-free optimization logic inside
-``ZeroOrderOptimizer``. The skeleton uses a 2-point central-difference
-estimator as a starting point — you are expected to replace or extend it.
-
-Key design points
------------------
-* **Layer selection** is entirely your responsibility. Set ``self.layer_names``
-  to the list of parameter names you want to optimize. You can change this list
-  at any time — even between ``.step()`` calls — to implement curriculum or
-  progressive-layer strategies.
-* **Compute budget** is enforced by ``validate.py``: ``.step()`` is called
-  exactly ``n_batches`` times. Each call may invoke the model as many times as
-  your estimator requires, but be mindful that more evaluations per step leave
-  fewer steps in the total budget.
-* **No gradients** are computed anywhere in this file. All updates must be
-  derived from scalar loss values obtained by calling ``loss_fn()``.
-"""
-
 from __future__ import annotations
 
-import math
 from typing import Callable
+import os
+import numpy as np
 
 import torch
 import torch.nn as nn
+import torchvision
+from torchvision import models
+from torch.utils.data import DataLoader, Subset
+from sklearn.decomposition import PCA
 
 
 class ZeroOrderOptimizer:
-    """Gradient-free optimizer for fine-tuning a subset of model parameters.
 
-    The optimizer maintains a list of *active* parameter names
-    (``self.layer_names``). On each ``.step()`` call it perturbs only those
-    parameters, estimates a pseudo-gradient from forward-pass loss values, and
-    applies an update. All other parameters remain strictly frozen.
-
-    Args:
-        model:            The ``nn.Module`` to optimize.
-        lr:               Step size / learning rate.
-        eps:              Perturbation magnitude for the finite-difference
-                          estimator.
-        perturbation_mode: Distribution used to sample the perturbation
-                          direction. ``"gaussian"`` draws from N(0, I);
-                          ``"uniform"`` draws from U(-1, 1) and normalises.
-
-    Student task:
-        1. Set ``self.layer_names`` to the parameter names you want to tune.
-           Inspect available names with ``[n for n, _ in model.named_parameters()]``.
-        2. Replace or extend ``_estimate_grad`` with a better estimator.
-        3. Replace or extend ``_update_params`` with a better update rule.
-        4. Optionally change ``self.layer_names`` inside ``.step()`` to
-           implement dynamic layer selection strategies.
-
-    Example — tune only the final linear layer::
-
-        optimizer = ZeroOrderOptimizer(model)
-        optimizer.layer_names = ["fc.weight", "fc.bias"]
-    """
 
     def __init__(
         self,
         model: nn.Module,
-        lr: float = 1e-3,
-        eps: float = 1e-3,
+        lr: float = 0.02,
+        eps: float = 0.5,
         perturbation_mode: str = "gaussian",
     ) -> None:
         self.model = model
         self.lr = lr
         self.eps = eps
-
-        if perturbation_mode not in ("gaussian", "uniform"):
-            raise ValueError(
-                f"perturbation_mode must be 'gaussian' or 'uniform', "
-                f"got '{perturbation_mode}'"
-            )
         self.perturbation_mode = perturbation_mode
 
-        # ------------------------------------------------------------------
-        # STUDENT: Set self.layer_names to the parameters you want to tune.
-        #
-        # The default below selects only the final classification head.
-        # You may replace this with any subset of named parameters, e.g.:
-        #   self.layer_names = ["layer4.1.conv2.weight", "fc.weight", "fc.bias"]
-        #
-        # You can also update self.layer_names inside .step() to implement
-        # a dynamic schedule (e.g. gradually unfreeze deeper layers).
-        # ------------------------------------------------------------------
-        self.layer_names: list[str] = ["fc.weight", "fc.bias"]
-        # ------------------------------------------------------------------
+        self.layer_names = ["fc.weight_pca_hard_low_rank"]
 
-    # ------------------------------------------------------------------
-    # Internal helpers — students may modify these.
-    # ------------------------------------------------------------------
+        self.hard_class_ids = [
+            55, 93, 72, 32, 35, 80, 50, 3, 74, 14,
+            7, 45, 26, 11, 59, 65, 67, 77, 84, 47,
+            44, 4, 27, 64, 98, 79, 51, 63, 66, 96,
+        ]
 
-    def _active_params(self) -> dict[str, nn.Parameter]:
-        """Return a mapping from name → parameter for all active layer names.
+        pca_extra_class_ids = [
+            73, 52, 46, 36, 18, 24, 13, 81, 90, 91, 95
+        ]
+        self.pca_class_ids = sorted(set(self.hard_class_ids + pca_extra_class_ids))
 
-        Only parameters whose names appear in ``self.layer_names`` are
-        returned. Parameters not in this mapping are never modified.
+        self.rank = 32
+        self.relative_correction_scale = 0.10
 
-        Returns:
-            Dict mapping parameter name to its ``nn.Parameter`` tensor.
+        self.samples_per_class = 40
+        self.seed = 42
+        self.data_root = os.environ.get("DATA_DIR", "./data")
 
-        Raises:
-            KeyError: If a name in ``self.layer_names`` does not exist in the
-                      model.
-        """
-        named = dict(self.model.named_parameters())
-        missing = [n for n in self.layer_names if n not in named]
-        if missing:
-            raise KeyError(
-                f"The following layer names were not found in the model: "
-                f"{missing}. Use [n for n, _ in model.named_parameters()] "
-                f"to inspect valid names."
+        # Adam-like ZO
+        self.beta1 = 0.9
+        self.beta2 = 0.999
+        self.adam_eps = 1e-8
+        self.t = 0
+        self.step_count = 0
+
+        self.max_grad_norm = 10.0
+        self.max_update_norm = 0.08
+        self.accept_only_if_improves = True
+
+        self._init_state()
+
+    def _init_state(self) -> None:
+        fc = self.model.fc
+        if not isinstance(fc, nn.Linear):
+            raise TypeError("Expected model.fc to be nn.Linear")
+
+        device = fc.weight.device
+        dtype = fc.weight.dtype
+
+        out_features, in_features = fc.weight.shape
+        if in_features != 512:
+            raise ValueError(f"Expected 512 input features, got {in_features}")
+        if self.rank > in_features:
+            raise ValueError(f"rank={self.rank} cannot exceed {in_features}")
+
+        self.base_weight = fc.weight.detach().clone()
+        self.base_bias = fc.bias.detach().clone() if fc.bias is not None else None
+
+        self.hard_ids = torch.tensor(
+            self.hard_class_ids,
+            device=device,
+            dtype=torch.long,
+        )
+
+        hard_base = self.base_weight.index_select(0, self.hard_ids)
+        self.base_norm = hard_base.norm(dim=1).mean().clamp_min(1e-12)
+        self.correction_scale = self.relative_correction_scale * self.base_norm
+
+        self.B = self._build_pca_basis(
+            rank=self.rank,
+            device=device,
+            dtype=dtype,
+        )
+
+        self.A = torch.zeros(
+            len(self.hard_class_ids),
+            self.rank,
+            device=device,
+            dtype=dtype,
+        )
+
+        self.m = torch.zeros_like(self.A)
+        self.v = torch.zeros_like(self.A)
+
+        self._apply_current_weight()
+
+    def _build_pca_basis(
+        self,
+        rank: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        weights = models.ResNet18_Weights.IMAGENET1K_V1
+        transform = weights.transforms()
+
+        train_dataset = torchvision.datasets.CIFAR100(
+            root=self.data_root,
+            train=True,
+            download=True,
+            transform=transform,
+        )
+
+        targets = np.array(train_dataset.targets)
+        rng = np.random.default_rng(self.seed)
+
+        selected_indices = []
+        selected_labels = []
+
+        # Тот же balanced subset 40/class, что и в head_init.py
+        for class_id in range(100):
+            class_indices = np.where(targets == class_id)[0]
+            chosen = rng.choice(
+                class_indices,
+                size=self.samples_per_class,
+                replace=False,
             )
-        return {n: named[n] for n in self.layer_names}
+            selected_indices.extend(chosen.tolist())
+            selected_labels.extend([class_id] * self.samples_per_class)
 
-    def _sample_direction(self, param: torch.Tensor) -> torch.Tensor:
-        """Sample a random unit-norm perturbation vector of the same shape as ``param``.
+        selected_indices = np.array(selected_indices)
+        selected_labels = np.array(selected_labels)
 
-        Args:
-            param: The parameter tensor whose shape determines the output shape.
+        # Для PCA оставляем только hard classes + confusers
+        mask = np.isin(selected_labels, self.pca_class_ids)
+        pca_indices = selected_indices[mask]
 
-        Returns:
-            A tensor of the same shape as ``param``, normalised to unit L2 norm.
-        """
-        if self.perturbation_mode == "gaussian":
-            u = torch.randn_like(param)
-        else:  # uniform
-            u = torch.rand_like(param) * 2.0 - 1.0
+        subset = Subset(train_dataset, pca_indices.tolist())
 
-        norm = u.norm()
+        loader = DataLoader(
+            subset,
+            batch_size=256,
+            shuffle=False,
+            num_workers=0,
+            pin_memory=False,
+        )
+
+        feature_model = models.resnet18(weights=weights)
+        feature_model.fc = nn.Identity()
+        feature_model.eval()
+        feature_model.to(device)
+
+        X_list = []
+
+        with torch.no_grad():
+            for images, _ in loader:
+                images = images.to(device)
+                features = feature_model(images).cpu().numpy()
+                X_list.append(features)
+
+        X = np.concatenate(X_list, axis=0)
+
+        pca = PCA(
+            n_components=rank,
+            whiten=False,
+            random_state=self.seed,
+        )
+        pca.fit(X)
+
+        B_np = pca.components_.astype(np.float32)
+
+        del feature_model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        return torch.tensor(B_np, device=device, dtype=dtype).contiguous()
+
+    def _current_weight(self) -> torch.Tensor:
+        current = self.base_weight.clone()
+
+        correction = self.correction_scale * (self.A @ self.B)
+        hard_base_rows = current.index_select(0, self.hard_ids)
+        hard_new_rows = hard_base_rows + correction
+
+        current.index_copy_(0, self.hard_ids, hard_new_rows)
+        return current
+
+    def _apply_current_weight(self) -> None:
+        with torch.no_grad():
+            self.model.fc.weight.copy_(self._current_weight())
+
+            if self.base_bias is not None and self.model.fc.bias is not None:
+                self.model.fc.bias.copy_(self.base_bias)
+
+    def _loss_value(self, loss_fn: Callable[[], float]) -> float:
+        with torch.no_grad():
+            loss = loss_fn()
+
+        if isinstance(loss, torch.Tensor):
+            return float(loss.detach().cpu().item())
+        return float(loss)
+
+    def _sample_direction(self) -> torch.Tensor:
+        if self.perturbation_mode == "uniform":
+            direction = torch.rand_like(self.A) * 2.0 - 1.0
+        else:
+            direction = torch.randn_like(self.A)
+
+        norm = direction.norm()
         if norm > 0:
-            u = u / norm
-        return u
+            direction = direction / norm
 
-    def _estimate_grad(
-        self,
-        loss_fn: Callable[[], float],
-        params: dict[str, nn.Parameter],
-    ) -> dict[str, torch.Tensor]:
-        """Estimate a pseudo-gradient for each active parameter.
+        return direction
 
-        Skeleton: 2-point central-difference estimator.
-        For each active parameter ``p`` independently:
-            1. Sample a random unit vector ``u`` of the same shape as ``p``.
-            2. Evaluate  f_plus  = loss_fn() with ``p ← p + eps * u``
-            3. Evaluate  f_minus = loss_fn() with ``p ← p - eps * u``
-            4. Restore ``p`` to its original value.
-            5. Pseudo-gradient ← ``(f_plus - f_minus) / (2 * eps) * u``
-
-        This is an unbiased estimator of the directional derivative along ``u``
-        scaled back to parameter space.
-
-        Args:
-            loss_fn: Callable that evaluates the objective on the current batch
-                     and returns a scalar ``float``. May be called multiple
-                     times; each call must use the *same* batch.
-            params:  Dict of active parameter name → tensor (from
-                     ``_active_params``).
-
-        Returns:
-            Dict mapping each parameter name to its estimated pseudo-gradient
-            tensor (same shape as the parameter).
-
-        Student task:
-            Replace this with a more efficient or accurate estimator:
-        """
-        # ------------------------------------------------------------------
-        # STUDENT: Replace or extend the gradient estimation below.
-        # ------------------------------------------------------------------
-        grads: dict[str, torch.Tensor] = {}
+    def _estimate_grad(self, loss_fn: Callable[[], float]) -> torch.Tensor:
+        direction = self._sample_direction()
 
         with torch.no_grad():
-            for name, param in params.items():
-                u = self._sample_direction(param)
+            self.A.add_(self.eps * direction)
+            self._apply_current_weight()
+            f_plus = self._loss_value(loss_fn)
 
-                # f(x + eps * u)
-                param.data.add_(self.eps * u)
-                f_plus = loss_fn()
+            self.A.sub_(2.0 * self.eps * direction)
+            self._apply_current_weight()
+            f_minus = self._loss_value(loss_fn)
 
-                # f(x - eps * u)  — restore then subtract
-                param.data.sub_(2.0 * self.eps * u)
-                f_minus = loss_fn()
+            self.A.add_(self.eps * direction)
+            self._apply_current_weight()
 
-                # Restore original value
-                param.data.add_(self.eps * u)
+        dim = self.A.numel()
+        grad = dim * ((f_plus - f_minus) / (2.0 * self.eps)) * direction
 
-                grad_estimate = ((f_plus - f_minus) / (2.0 * self.eps)) * u
-                grads[name] = grad_estimate
+        grad_norm = grad.norm()
+        if grad_norm > self.max_grad_norm:
+            grad = grad * (self.max_grad_norm / (grad_norm + 1e-12))
 
-        return grads
-        # ------------------------------------------------------------------
+        return grad
 
-    def _update_params(
-        self,
-        params: dict[str, nn.Parameter],
-        grads: dict[str, torch.Tensor],
-    ) -> None:
-        """Apply the estimated pseudo-gradients to the active parameters.
+    def _adam_update(self, grad: torch.Tensor) -> torch.Tensor:
+        self.t += 1
 
-        Skeleton: vanilla gradient *descent* step (minimising the loss).
-            ``p ← p - lr * grad``
+        self.m.mul_(self.beta1).add_(grad, alpha=1.0 - self.beta1)
+        self.v.mul_(self.beta2).addcmul_(grad, grad, value=1.0 - self.beta2)
 
-        Args:
-            params: Dict of active parameter name → tensor.
-            grads:  Dict of pseudo-gradient name → tensor (same keys as
-                    ``params``).
+        m_hat = self.m / (1.0 - self.beta1 ** self.t)
+        v_hat = self.v / (1.0 - self.beta2 ** self.t)
 
-        Student task:
-            Replace with a more sophisticated update rule, e.g.:
-              - Momentum: accumulate an exponential moving average of gradients.
-              - Adam-style: maintain first and second moment estimates.
-              - Clipped update: ``p ← p - lr * clip(grad, max_norm)``.
-        """
-        # ------------------------------------------------------------------
-        # STUDENT: Replace or extend the parameter update below.
-        # ------------------------------------------------------------------
-        with torch.no_grad():
-            for name, param in params.items():
-                param.data.sub_(self.lr * grads[name])
-        # ------------------------------------------------------------------
+        update = self.lr * m_hat / (v_hat.sqrt() + self.adam_eps)
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
+        update_norm = update.norm()
+        if update_norm > self.max_update_norm:
+            update = update * (self.max_update_norm / (update_norm + 1e-12))
+
+        return update
 
     def step(self, loss_fn: Callable[[], float]) -> float:
-        """Perform one zero-order optimisation step.
+        self.step_count += 1
 
-        Calls ``loss_fn`` one or more times to estimate pseudo-gradients for
-        the currently active parameters (``self.layer_names``), then applies
-        an update. Parameters *not* in ``self.layer_names`` are never touched.
+        self._apply_current_weight()
+        loss_before = self._loss_value(loss_fn)
 
-        Args:
-            loss_fn: A callable that takes no arguments and returns a scalar
-                     ``float`` representing the loss on the current mini-batch.
-                     ``validate.py`` guarantees that every call to ``loss_fn``
-                     within a single ``.step()`` invocation uses the *same*
-                     fixed batch of data.
+        old_A = self.A.detach().clone()
+        old_m = self.m.detach().clone()
+        old_v = self.v.detach().clone()
+        old_t = self.t
 
-        Returns:
-            The loss value at the *start* of the step (before any update),
-            obtained from the first call to ``loss_fn()``.
+        grad = self._estimate_grad(loss_fn)
+        update = self._adam_update(grad)
 
-        Note:
-            ``validate.py`` calls ``.step()`` exactly ``n_batches`` times.
-            Each forward pass inside ``loss_fn`` counts toward your compute
-            budget, so prefer estimators that minimise the number of calls.
-        """
-        params = self._active_params()
-
-        # Record the loss before any perturbation.
         with torch.no_grad():
-            loss_before = loss_fn()
+            self.A.sub_(update)
+            self._apply_current_weight()
 
-        grads = self._estimate_grad(loss_fn, params)
-        self._update_params(params, grads)
+        loss_after = self._loss_value(loss_fn)
 
+        if self.accept_only_if_improves and loss_after > loss_before:
+            with torch.no_grad():
+                self.A.copy_(old_A)
+                self.m.copy_(old_m)
+                self.v.copy_(old_v)
+                self.t = old_t
+                self._apply_current_weight()
+            accepted = False
+        else:
+            accepted = True
+
+        if self.step_count % 8 == 0:
+            with torch.no_grad():
+                current_w = self._current_weight()
+                delta = current_w - self.base_weight
+
+                rel_delta = delta.norm() / (self.base_weight.norm() + 1e-12)
+
+                hard_delta = delta.index_select(0, self.hard_ids)
+                hard_base = self.base_weight.index_select(0, self.hard_ids)
+
+                hard_row_rel_delta = hard_delta.norm(dim=1).mean() / (
+                    hard_base.norm(dim=1).mean() + 1e-12
+                )
+
+                max_hard_row_rel_delta = (
+                    hard_delta.norm(dim=1) /
+                    (hard_base.norm(dim=1) + 1e-12)
+                ).max()
+
+                print(
+                    f"[HardPCALowRankZO] step={self.step_count:03d} "
+                    f"loss_before={loss_before:.4f} "
+                    f"loss_after={loss_after:.4f} "
+                    f"accepted={accepted} "
+                    f"rel_delta={rel_delta.item():.4f} "
+                    f"hard_row_rel_delta={hard_row_rel_delta.item():.4f} "
+                    f"max_hard_row_rel_delta={max_hard_row_rel_delta.item():.4f} "
+                    f"A_norm={self.A.norm().item():.4f}"
+                )
         return float(loss_before)
